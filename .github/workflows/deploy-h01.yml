@@ -74,12 +74,12 @@ jobs:
           fi
           echo "Standalone root: $STANDALONE_ROOT"
 
-          # Create release directory
+          # Create release directory and copy standalone output
+          # Use /. instead of /* to include hidden dirs like .next/
           mkdir -p "release"
-          cp -r "$STANDALONE_ROOT"/* release/
+          cp -r "$STANDALONE_ROOT"/. release/
 
-          # Copy static assets (mkdir -p because standalone output has no .next subdir)
-          mkdir -p release/.next
+          # Copy static assets into the .next/ that came from standalone
           cp -r .next/static release/.next/static
           if [ -d public ]; then
             cp -r public release/public
