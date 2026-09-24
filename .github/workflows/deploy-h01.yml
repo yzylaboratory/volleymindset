@@ -1,0 +1,159 @@
+name: Deploy to Hetzner H01
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "public/**"
+      - "package*.json"
+      - "next.config.*"
+      - "docker-compose.yml"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-h01
+  cancel-in-progress: false
+
+env:
+  REMOTE_HOST: "167.233.218.242"
+  REMOTE_USER: root
+  REMOTE_ROOT: /root/apps/volleymindset
+  COMPOSE_PROJECT: volleymindset
+  HEALTH_URL: "http://127.0.0.1:8809/api/health"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate SSH key secret
+        run: |
+          if [ -z "${{ secrets.H01_SSH_PRIVATE_KEY }}" ]; then
+            echo "::error::H01_SSH_PRIVATE_KEY secret is not set"
+            exit 1
+          fi
+          echo "SSH key secret is configured"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+
+      - name: Assemble standalone
+        id: assemble
+        run: |
+          set -e
+          RELEASE_ID=$(date +%Y%m%d-%H%M%S)-${{ github.sha }}
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+          # Detect standalone root
+          if [ -f ".next/standalone/server.js" ]; then
+            STANDALONE_ROOT=".next/standalone"
+          else
+            # Find server.js in nested directory (monorepo case)
+            SERVER_JS=$(find .next/standalone -name "server.js" -type f 2>/dev/null | head -1)
+            if [ -n "$SERVER_JS" ]; then
+              STANDALONE_ROOT=$(dirname "$SERVER_JS")
+            else
+              echo "::error::Could not find server.js in standalone output"
+              exit 1
+            fi
+          fi
+          echo "Standalone root: $STANDALONE_ROOT"
+
+          # Create release directory
+          mkdir -p "release"
+          cp -r "$STANDALONE_ROOT"/* release/
+
+          # Copy static assets
+          cp -r public release/public
+          cp -r .next/static release/.next/static
+
+          # Copy docker-compose
+          cp docker-compose.yml release/
+
+          echo "Release contents:"
+          ls -la release/
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.H01_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ env.REMOTE_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy to server
+        run: |
+          set -e
+          RELEASE_ID="${{ steps.assemble.outputs.release_id }}"
+          RELEASE_DIR="${{ env.REMOTE_ROOT }}/releases/$RELEASE_ID"
+
+          # Create release directory on remote
+          ssh -i ~/.ssh/deploy_key ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }} "mkdir -p $RELEASE_DIR"
+
+          # Upload release
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            release/ \
+            ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }}:$RELEASE_DIR/
+
+          # Update symlinks and restart
+          ssh -i ~/.ssh/deploy_key ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }} << EOF
+            set -e
+            cd ${{ env.REMOTE_ROOT }}
+
+            # Backup previous symlink
+            if [ -L current ]; then
+              rm -f previous
+              cp -P current previous
+            fi
+
+            # Update current symlink
+            ln -sfn releases/$RELEASE_ID current
+
+            # Start/restart container
+            cd current
+            docker compose -p ${{ env.COMPOSE_PROJECT }} up -d --force-recreate
+          EOF
+
+      - name: Health check
+        run: |
+          echo "Waiting for service to be healthy..."
+          for i in $(seq 1 30); do
+            RESPONSE=$(ssh -i ~/.ssh/deploy_key ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }} \
+              "curl -s -o /dev/null -w '%{http_code}' ${{ env.HEALTH_URL }}" 2>/dev/null || echo "000")
+            
+            if [ "$RESPONSE" = "200" ]; then
+              echo "Health check passed (attempt $i)"
+              exit 0
+            fi
+            
+            echo "Attempt $i/30: HTTP $RESPONSE - waiting 2s..."
+            sleep 2
+          done
+
+          echo "::error::Health check failed after 30 attempts"
+          
+          # Dump logs on failure
+          echo "Container logs:"
+          ssh -i ~/.ssh/deploy_key ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }} \
+            "docker compose -p ${{ env.COMPOSE_PROJECT }} logs --tail=100" || true
+          
+          exit 1
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
