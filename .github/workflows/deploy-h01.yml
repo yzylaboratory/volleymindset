@@ -106,6 +106,7 @@ jobs:
 
           # Upload release
           rsync -avz --delete \
+            --exclude '.env*' \
             -e "ssh -i ~/.ssh/deploy_key" \
             release/ \
             ${{ env.REMOTE_USER }}@${{ env.REMOTE_HOST }}:$RELEASE_DIR/
