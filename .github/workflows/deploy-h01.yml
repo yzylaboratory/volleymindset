@@ -78,9 +78,12 @@ jobs:
           mkdir -p "release"
           cp -r "$STANDALONE_ROOT"/* release/
 
-          # Copy static assets
-          cp -r public release/public
+          # Copy static assets (mkdir -p because standalone output has no .next subdir)
+          mkdir -p release/.next
           cp -r .next/static release/.next/static
+          if [ -d public ]; then
+            cp -r public release/public
+          fi
 
           # Copy docker-compose
           cp docker-compose.yml release/
